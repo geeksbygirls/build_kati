@@ -134,7 +134,7 @@ def normalize_make_log(expected, mk, via_ninja)
   # GNU make 4.0 has this output.
   expected.gsub!(/Makefile:\d+: commands for target ".*?" failed\n/, '')
   # We treat some warnings as errors.
-  expected.gsub!(/^\/bin\/sh: line 0: /, '')
+  expected.gsub!(/^\/bin\/(ba)?sh: line 0: /, '')
   # We print out some ninja warnings in some tests to match what we expect
   # ninja to produce. Remove them if we're not testing ninja.
   if !via_ninja
@@ -164,6 +164,8 @@ def normalize_kati_log(output)
                "\\1\\2: N\\3")
   output
 end
+
+bash_var = ' SHELL=/bin/bash'
 
 run_make_test = proc do |mk|
   c = File.read(mk)
@@ -213,6 +215,7 @@ run_make_test = proc do |mk|
       if via_ninja || is_silent_test
         cmd += ' -s'
       end
+      cmd += bash_var
       cmd += " #{tc} 2>&1"
       res = `#{cmd}`
       res = normalize_make_log(res, mk, via_ninja)
@@ -240,6 +243,7 @@ run_make_test = proc do |mk|
       if is_silent_test
         cmd += ' -s'
       end
+      cmd += bash_var
       if !gen_all_targets || mk =~ /makecmdgoals/
         cmd += " #{tc}"
       end
@@ -322,6 +326,7 @@ run_shell_test = proc do |sh|
     if is_ninja_test
       cmd += ' -s'
     end
+    cmd += bash_var
     expected = IO.popen(cmd, 'r:binary', &:read)
     cleanup
 
@@ -338,6 +343,7 @@ run_shell_test = proc do |sh|
         cmd = "sh ../../#{sh} ../../kati --use_cache -log_dir=."
       end
     end
+    cmd += bash_var
 
     output = IO.popen(cmd, 'r:binary', &:read)
 
