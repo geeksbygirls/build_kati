@@ -23,6 +23,7 @@
 
 #include "fileutil.h"
 #include "find.h"
+#include "func.h"
 #include "io.h"
 #include "log.h"
 #include "ninja.h"
@@ -52,11 +53,14 @@ class StampChecker {
   };
 
   struct ShellResult {
+    CommandOp op;
+    string shell;
+    string shellflag;
     string cmd;
     string result;
     vector<string> missing_dirs;
+    vector<string> files;
     vector<string> read_dirs;
-    bool has_condition;
   };
 
  public:
@@ -131,7 +135,7 @@ class StampChecker {
     const string& stamp_filename = GetNinjaStampFilename();
     FILE* fp = fopen(stamp_filename.c_str(), "rb");
     if (!fp) {
-      if (g_flags.dump_kati_stamp)
+      if (g_flags.regen_debug)
         printf("%s: %s\n", stamp_filename.c_str(), strerror(errno));
       return true;
     }
@@ -144,7 +148,7 @@ class StampChecker {
       fprintf(stderr, "incomplete kati_stamp, regenerating...\n");
       RETURN_TRUE;
     }
-    if (g_flags.dump_kati_stamp)
+    if (g_flags.regen_debug)
       printf("Generated time: %f\n", gen_time);
 
     string s, s2;
@@ -162,7 +166,7 @@ class StampChecker {
           }
         }
         if (ShouldIgnoreDirty(s)) {
-          if (g_flags.dump_kati_stamp)
+          if (g_flags.regen_debug)
             printf("file %s: ignored (%f)\n", s.c_str(), ts);
           continue;
         }
@@ -230,21 +234,28 @@ class StampChecker {
     for (int i = 0; i < num_crs; i++) {
       ShellResult* sr = new ShellResult;
       commands_.push_back(sr);
+      sr->op = static_cast<CommandOp>(LOAD_INT(fp));
+      LOAD_STRING(fp, &sr->shell);
+      LOAD_STRING(fp, &sr->shellflag);
       LOAD_STRING(fp, &sr->cmd);
       LOAD_STRING(fp, &sr->result);
-      sr->has_condition = LOAD_INT(fp);
-      if (!sr->has_condition)
-        continue;
 
-      int num_missing_dirs = LOAD_INT(fp);
-      for (int j = 0; j < num_missing_dirs; j++) {
-        LOAD_STRING(fp, &s);
-        sr->missing_dirs.push_back(s);
-      }
-      int num_read_dirs = LOAD_INT(fp);
-      for (int j = 0; j < num_read_dirs; j++) {
-        LOAD_STRING(fp, &s);
-        sr->read_dirs.push_back(s);
+      if (sr->op == CommandOp::FIND) {
+        int num_missing_dirs = LOAD_INT(fp);
+        for (int j = 0; j < num_missing_dirs; j++) {
+          LOAD_STRING(fp, &s);
+          sr->missing_dirs.push_back(s);
+        }
+        int num_files = LOAD_INT(fp);
+        for (int j = 0; j < num_files; j++) {
+          LOAD_STRING(fp, &s);
+          sr->files.push_back(s);
+        }
+        int num_read_dirs = LOAD_INT(fp);
+        for (int j = 0; j < num_read_dirs; j++) {
+          LOAD_STRING(fp, &s);
+          sr->read_dirs.push_back(s);
+        }
       }
     }
 
@@ -261,7 +272,6 @@ class StampChecker {
     COLLECT_STATS("glob time (regen)");
     vector<string>* files;
     Glob(gr->pat.c_str(), &files);
-    sort(files->begin(), files->end());
     bool needs_regen = files->size() != gr->result.size();
     for (size_t i = 0; i < gr->result.size(); i++) {
       if (!needs_regen) {
@@ -291,12 +301,16 @@ class StampChecker {
   }
 
   bool ShouldRunCommand(const ShellResult* sr) {
-    if (!sr->has_condition)
+    if (sr->op != CommandOp::FIND)
       return true;
 
     COLLECT_STATS("stat time (regen)");
     for (const string& dir : sr->missing_dirs) {
       if (Exists(dir))
+        return true;
+    }
+    for (const string& file : sr->files) {
+      if (!Exists(file))
         return true;
     }
     for (const string& dir : sr->read_dirs) {
@@ -323,8 +337,56 @@ class StampChecker {
   }
 
   bool CheckShellResult(const ShellResult* sr, string* err) {
-    if (!ShouldRunCommand(sr)) {
+    if (sr->op == CommandOp::READ_MISSING) {
+      if (Exists(sr->cmd)) {
+        if (g_flags.dump_kati_stamp)
+          printf("file %s: dirty\n", sr->cmd.c_str());
+        else
+          *err = StringPrintf("$(file <%s) was changed, regenerating...\n",
+                              sr->cmd.c_str());
+        return true;
+      }
       if (g_flags.dump_kati_stamp)
+        printf("file %s: clean\n", sr->cmd.c_str());
+      return false;
+    }
+
+    if (sr->op == CommandOp::READ) {
+      double ts = GetTimestamp(sr->cmd);
+      if (gen_time_ < ts) {
+        if (g_flags.dump_kati_stamp)
+          printf("file %s: dirty\n", sr->cmd.c_str());
+        else
+          *err = StringPrintf("$(file <%s) was changed, regenerating...\n",
+                              sr->cmd.c_str());
+        return true;
+      }
+      if (g_flags.dump_kati_stamp)
+        printf("file %s: clean\n", sr->cmd.c_str());
+      return false;
+    }
+
+    if (sr->op == CommandOp::WRITE || sr->op == CommandOp::APPEND) {
+      FILE* f = fopen(sr->cmd.c_str(), (sr->op == CommandOp::WRITE) ? "wb" : "ab");
+      if (f == NULL) {
+        PERROR("fopen");
+      }
+
+      if (fwrite(&sr->result[0], sr->result.size(), 1, f) != 1) {
+        PERROR("fwrite");
+      }
+
+      if (fclose(f) != 0) {
+        PERROR("fclose");
+      }
+
+      if (g_flags.dump_kati_stamp)
+        printf("file %s: clean (write)\n", sr->cmd.c_str());
+      return false;
+    }
+
+    if (!ShouldRunCommand(sr)) {
+      if (g_flags.regen_debug)
         printf("shell %s: clean (no rerun)\n", sr->cmd.c_str());
       return false;
     }
@@ -339,7 +401,7 @@ class StampChecker {
 
     COLLECT_STATS_WITH_SLOW_REPORT("shell time (regen)", sr->cmd.c_str());
     string result;
-    RunCommand("/bin/sh", sr->cmd, RedirectStderr::DEV_NULL, &result);
+    RunCommand(sr->shell, sr->shellflag, sr->cmd, RedirectStderr::DEV_NULL, &result);
     FormatForCommandSubstitution(&result);
     if (sr->result != result) {
       if (g_flags.dump_kati_stamp) {
@@ -350,7 +412,7 @@ class StampChecker {
         //*err += StringPrintf("%s => %s\n", expected.c_str(), result.c_str());
       }
       return true;
-    } else if (g_flags.dump_kati_stamp) {
+    } else if (g_flags.regen_debug) {
       printf("shell %s: clean (rerun)\n", sr->cmd.c_str());
     }
     return false;
@@ -374,8 +436,8 @@ class StampChecker {
         }
       });
 
-    for (ShellResult* sr : commands_) {
-      tp->Submit([this, sr]() {
+    tp->Submit([this]() {
+        for (ShellResult* sr : commands_) {
           string err;
           if (CheckShellResult(sr, &err)) {
             unique_lock<mutex> lock(mu_);
@@ -384,8 +446,8 @@ class StampChecker {
               msg_ = err;
             }
           }
-        });
-    }
+        }
+      });
 
     tp->Wait();
     if (needs_regen_) {

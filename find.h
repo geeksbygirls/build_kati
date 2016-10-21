@@ -41,7 +41,7 @@ struct FindCommand {
   FindCommandType type;
   string chdir;
   string testdir;
-  vector<StringPiece> finddirs;
+  vector<string> finddirs;
   bool follows_symlinks;
   unique_ptr<FindCond> print_cond;
   unique_ptr<FindCond> prune_cond;
@@ -49,6 +49,7 @@ struct FindCommand {
   int mindepth;
   bool redirect_to_devnull;
 
+  unique_ptr<vector<string>> found_files;
   unique_ptr<unordered_set<string>> read_dirs;
 
  private:

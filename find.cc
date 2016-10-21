@@ -23,6 +23,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <memory>
 #include <vector>
 
@@ -38,6 +39,8 @@ class FindCond {
  public:
   virtual ~FindCond() = default;
   virtual bool IsTrue(const string& path, unsigned char type) const = 0;
+  virtual bool Countable() const = 0;
+  virtual unsigned Count() const = 0;
  protected:
   FindCond() = default;
 };
@@ -48,12 +51,20 @@ class NameCond : public FindCond {
  public:
   explicit NameCond(const string& n)
       : name_(n) {
+    has_wildcard_ = (n.find_first_of("?*[") != string::npos);
   }
   virtual bool IsTrue(const string& path, unsigned char) const override {
     return fnmatch(name_.c_str(), Basename(path).data(), 0) == 0;
   }
+  virtual bool Countable() const override {
+    return !has_wildcard_;
+  }
+  virtual unsigned Count() const override {
+    return 1;
+  }
  private:
   string name_;
+  bool has_wildcard_;
 };
 
 class TypeCond : public FindCond {
@@ -63,6 +74,12 @@ class TypeCond : public FindCond {
   }
   virtual bool IsTrue(const string&, unsigned char type) const override {
     return type == type_;
+  }
+  virtual bool Countable() const override {
+    return false;
+  }
+  virtual unsigned Count() const override {
+    return 0;
   }
  private:
   unsigned char type_;
@@ -75,6 +92,12 @@ class NotCond : public FindCond {
   }
   virtual bool IsTrue(const string& path, unsigned char type) const override {
     return !c_->IsTrue(path, type);
+  }
+  virtual bool Countable() const override {
+    return false;
+  }
+  virtual unsigned Count() const override {
+    return 0;
   }
  private:
   unique_ptr<FindCond> c_;
@@ -90,6 +113,12 @@ class AndCond : public FindCond {
       return c2_->IsTrue(path, type);
     return false;
   }
+  virtual bool Countable() const override {
+    return false;
+  }
+  virtual unsigned Count() const override {
+    return 0;
+  }
  private:
   unique_ptr<FindCond> c1_, c2_;
 };
@@ -103,6 +132,12 @@ class OrCond : public FindCond {
     if (!c1_->IsTrue(path, type))
       return c2_->IsTrue(path, type);
     return true;
+  }
+  virtual bool Countable() const override {
+    return c1_->Countable() && c2_->Countable();;
+  }
+  virtual unsigned Count() const override {
+    return c1_->Count() + c2_->Count();
   }
  private:
   unique_ptr<FindCond> c1_, c2_;
@@ -118,7 +153,7 @@ class DirentNode {
   virtual bool RunFind(const FindCommand& fc, int d,
                        string* path,
                        unordered_map<const DirentNode*, string>* cur_read_dirs,
-                       string* out) const = 0;
+                       vector<string>& out) const = 0;
 
   virtual bool IsDirectory() const = 0;
 
@@ -133,13 +168,12 @@ class DirentNode {
                         const string& path,
                         unsigned char type,
                         int d,
-                        string* out) const {
+                        vector<string>& out) const {
     if (fc.print_cond && !fc.print_cond->IsTrue(path, type))
       return;
     if (d < fc.mindepth)
       return;
-    *out += path;
-    *out += ' ';
+    out.push_back(path);
   }
 
   string base_;
@@ -154,7 +188,7 @@ class DirentFileNode : public DirentNode {
   virtual bool RunFind(const FindCommand& fc, int d,
                        string* path,
                        unordered_map<const DirentNode*, string>*,
-                       string* out) const override {
+                       vector<string>& out) const override {
     PrintIfNecessary(fc, *path, type_, d, out);
     return true;
   }
@@ -224,7 +258,7 @@ class DirentDirNode : public DirentNode {
   virtual bool RunFind(const FindCommand& fc, int d,
                        string* path,
                        unordered_map<const DirentNode*, string>* cur_read_dirs,
-                       string* out) const override {
+                       vector<string>& out) const override {
     ScopedReadDirTracker srdt(this, *path, cur_read_dirs);
     if (!srdt.ok()) {
       return true;
@@ -234,8 +268,7 @@ class DirentDirNode : public DirentNode {
 
     if (fc.prune_cond && fc.prune_cond->IsTrue(*path, DT_DIR)) {
       if (fc.type != FindCommandType::FINDLEAVES) {
-        *out += *path;
-        *out += ' ';
+        out.push_back(*path);
       }
       return true;
     }
@@ -247,7 +280,7 @@ class DirentDirNode : public DirentNode {
 
     size_t orig_path_size = path->size();
     if (fc.type == FindCommandType::FINDLEAVES) {
-      size_t orig_out_size = out->size();
+      size_t orig_out_size = out.size();
       for (const auto& p : children_) {
         DirentNode* c = p.second;
         // We will handle directories later.
@@ -259,9 +292,22 @@ class DirentDirNode : public DirentNode {
         if (!c->RunFind(fc, d + 1, path, cur_read_dirs, out))
           return false;
         path->resize(orig_path_size);
-        // Found a leaf, stop the search.
-        if (orig_out_size != out->size())
-          return true;
+      }
+
+      // Found a leaf, stop the search.
+      if (orig_out_size != out.size()) {
+        // If we've found all possible files in this directory, we don't need
+        // to add a regen dependency on the directory, we just need to ensure
+        // that the files are not removed.
+        if (fc.print_cond->Countable() &&
+            fc.print_cond->Count() == out.size() - orig_out_size) {
+          fc.read_dirs->erase(*path);
+          for (unsigned i = orig_out_size; i < out.size(); i++) {
+            fc.found_files->push_back(out[i]);
+          }
+        }
+
+        return true;
       }
 
       for (const auto& p : children_) {
@@ -314,7 +360,7 @@ class DirentSymlinkNode : public DirentNode {
   virtual bool RunFind(const FindCommand& fc, int d,
                        string* path,
                        unordered_map<const DirentNode*, string>* cur_read_dirs,
-                       string* out) const override {
+                       vector<string>& out) const override {
     unsigned char type = DT_LNK;
     if (fc.follows_symlinks && errno_ != ENOENT) {
       if (errno_) {
@@ -577,7 +623,7 @@ class FindCommandParser {
       } else if (tok.find_first_of("|;&><*'\"") != string::npos) {
         return false;
       } else {
-        fc_->finddirs.push_back(tok);
+        fc_->finddirs.push_back(tok.as_string());
       }
     }
   }
@@ -586,14 +632,30 @@ class FindCommandParser {
     fc_->type = FindCommandType::FINDLEAVES;
     fc_->follows_symlinks = true;
     StringPiece tok;
+    vector<string> findfiles;
     while (true) {
       if (!GetNextToken(&tok))
         return false;
       if (tok.empty()) {
-        if (fc_->finddirs.size() < 2)
-          return false;
-        fc_->print_cond.reset(new NameCond(fc_->finddirs.back().as_string()));
-        fc_->finddirs.pop_back();
+        if (fc_->finddirs.size() == 0) {
+          // backwards compatibility
+          if (findfiles.size() < 2)
+            return false;
+          fc_->finddirs.swap(findfiles);
+          fc_->print_cond.reset(new NameCond(fc_->finddirs.back()));
+          fc_->finddirs.pop_back();
+        } else {
+          if (findfiles.size() < 1)
+            return false;
+          for (auto& file : findfiles) {
+            FindCond* cond = new NameCond(file);
+            if (fc_->print_cond.get()) {
+              cond = new OrCond(fc_->print_cond.release(), cond);
+            }
+            CHECK(!fc_->print_cond.get());
+            fc_->print_cond.reset(cond);
+          }
+        }
         return true;
       }
 
@@ -614,11 +676,14 @@ class FindCommandParser {
           return false;
         }
         fc_->mindepth = d;
+      } else if (HasPrefix(tok, "--dir=")) {
+        StringPiece dir= tok.substr(strlen("--dir="));
+        fc_->finddirs.push_back(dir.as_string());
       } else if (HasPrefix(tok, "--")) {
         WARN("Unknown flag in findleaves.py: %.*s", SPF(tok));
         return false;
       } else {
-        fc_->finddirs.push_back(tok);
+        findfiles.push_back(tok.as_string());
       }
     }
   }
@@ -699,8 +764,7 @@ class FindEmulatorImpl : public FindEmulator {
     return (!HasPrefix(s, "../") &&
             !HasPrefix(s, "/") &&
             !HasPrefix(s, ".repo") &&
-            !HasPrefix(s, ".git") &&
-            !HasPrefix(s, "out"));
+            !HasPrefix(s, ".git"));
   }
 
   const DirentNode* FindDir(StringPiece d, bool* should_fallback) {
@@ -753,14 +817,13 @@ class FindEmulatorImpl : public FindEmulator {
       }
     }
 
-    const size_t orig_out_size = out->size();
-    for (StringPiece finddir : fc.finddirs) {
+    vector<string> results;
+    for (const string& finddir : fc.finddirs) {
       const string dir = ConcatDir(fc.chdir, finddir);
 
       if (!CanHandle(dir)) {
         LOG("FindEmulator: Cannot handle find dir (%s): %s",
             dir.c_str(), cmd.c_str());
-        out->resize(orig_out_size);
         return false;
       }
 
@@ -768,26 +831,35 @@ class FindEmulatorImpl : public FindEmulator {
       const DirentNode* base = FindDir(dir, &should_fallback);
       if (!base) {
         if (should_fallback) {
-          out->resize(orig_out_size);
           return false;
         }
         continue;
       }
 
-      string path = finddir.as_string();
+      string path = finddir;
       unordered_map<const DirentNode*, string> cur_read_dirs;
-      if (!base->RunFind(fc, 0, &path, &cur_read_dirs, out)) {
+      if (!base->RunFind(fc, 0, &path, &cur_read_dirs, results)) {
         LOG("FindEmulator: RunFind failed: %s", cmd.c_str());
-        out->resize(orig_out_size);
         return false;
       }
     }
 
-    if (!out->empty() && (*out)[out->size()-1] == ' ')
-      out->resize(out->size()-1);
+    if (results.size() > 0) {
+      // Calculate and reserve necessary space in out
+      size_t new_length = 0;
+      for (const string& result : results) {
+        new_length += result.size() + 1;
+      }
+      out->reserve(out->size() + new_length - 1);
 
-    if (fc.type == FindCommandType::FINDLEAVES) {
-      *out = SortWordsInString(*out);
+      if (fc.type == FindCommandType::FINDLEAVES) {
+        sort(results.begin(), results.end());
+      }
+
+      WordWriter writer(out);
+      for (const string& result : results) {
+        writer.Write(result);
+      }
     }
 
     LOG("FindEmulator: OK");
@@ -835,8 +907,7 @@ class FindEmulatorImpl : public FindEmulator {
       if (!strcmp(ent->d_name, ".") ||
           !strcmp(ent->d_name, "..") ||
           !strcmp(ent->d_name, ".repo") ||
-          !strcmp(ent->d_name, ".git") ||
-          !strcmp(ent->d_name, "out"))
+          !strcmp(ent->d_name, ".git"))
         continue;
 
       string npath = path;
@@ -926,6 +997,7 @@ class FindEmulatorImpl : public FindEmulator {
 FindCommand::FindCommand()
     : follows_symlinks(false), depth(INT_MAX), mindepth(INT_MIN),
       redirect_to_devnull(false),
+      found_files(new vector<string>()),
       read_dirs(new unordered_set<string>()) {
 }
 

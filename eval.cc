@@ -34,7 +34,10 @@ Evaluator::Evaluator()
     : last_rule_(NULL),
       current_scope_(NULL),
       avoid_io_(false),
-      eval_depth_(0) {
+      eval_depth_(0),
+      posix_sym_(Intern(".POSIX")),
+      is_posix_(false),
+      kati_readonly_(Intern(".KATI_READONLY")) {
 }
 
 Evaluator::~Evaluator() {
@@ -48,6 +51,7 @@ Var* Evaluator::EvalRHS(Symbol lhs, Value* rhs_v, StringPiece orig_rhs,
                         AssignOp op, bool is_override) {
   VarOrigin origin = (
       (is_bootstrap_ ? VarOrigin::DEFAULT :
+       is_commandline_ ? VarOrigin::COMMAND_LINE :
        is_override ? VarOrigin::OVERRIDE : VarOrigin::FILE));
 
   Var* rhs = NULL;
@@ -66,6 +70,8 @@ Var* Evaluator::EvalRHS(Symbol lhs, Value* rhs_v, StringPiece orig_rhs,
       Var* prev = LookupVarInCurrentScope(lhs);
       if (!prev->IsDefined()) {
         rhs = new RecursiveVar(rhs_v, origin, orig_rhs);
+      } else if (prev->ReadOnly()) {
+        Error(StringPrintf("*** cannot assign to readonly variable: %s", lhs.c_str()));
       } else {
         prev->AppendVar(this, rhs_v);
         rhs = prev;
@@ -98,10 +104,31 @@ void Evaluator::EvalAssign(const AssignStmt* stmt) {
   Symbol lhs = stmt->GetLhsSymbol(this);
   if (lhs.empty())
     Error("*** empty variable name.");
+
+  if (lhs == kati_readonly_) {
+    string rhs;
+    stmt->rhs->Eval(this, &rhs);
+    for (auto const& name : WordScanner(rhs)) {
+      Var* var = Intern(name).GetGlobalVar();
+      if (!var->IsDefined()) {
+        Error(StringPrintf("*** unknown variable: %s", name.as_string().c_str()));
+      }
+      var->SetReadOnly();
+    }
+    return;
+  }
+
   Var* rhs = EvalRHS(lhs, stmt->rhs, stmt->orig_rhs, stmt->op,
                      stmt->directive == AssignDirective::OVERRIDE);
-  if (rhs)
-    lhs.SetGlobalVar(rhs);
+  if (rhs) {
+    bool readonly;
+    lhs.SetGlobalVar(rhs,
+                     stmt->directive == AssignDirective::OVERRIDE,
+                     &readonly);
+    if (readonly) {
+      Error(StringPrintf("*** cannot assign to readonly variable: %s", lhs.c_str()));
+    }
+  }
 }
 
 void Evaluator::EvalRule(const RuleStmt* stmt) {
@@ -118,11 +145,19 @@ void Evaluator::EvalRule(const RuleStmt* stmt) {
 
   Rule* rule;
   RuleVarAssignment rule_var;
-  ParseRule(loc_, expr, stmt->term, &rule, &rule_var);
+  function<string()> after_term_fn = [this, stmt](){
+    return stmt->after_term ? stmt->after_term->Eval(this) : "";
+  };
+  ParseRule(loc_, expr, stmt->term, after_term_fn, &rule, &rule_var);
 
   if (rule) {
     if (stmt->term == ';') {
       rule->cmds.push_back(stmt->after_term);
+    }
+
+    for (Symbol o : rule->outputs) {
+      if (o == posix_sym_)
+        is_posix_ = true;
     }
 
     LOG("Rule: %s", rule->DebugString().c_str());
@@ -155,9 +190,29 @@ void Evaluator::EvalRule(const RuleStmt* stmt) {
     }
 
     current_scope_ = p.first->second;
+
+    if (lhs == kati_readonly_) {
+      string rhs_value;
+      rhs->Eval(this, &rhs_value);
+      for (auto const& name : WordScanner(rhs_value)) {
+        Var* var = current_scope_->Lookup(Intern(name));
+        if (!var->IsDefined()) {
+          Error(StringPrintf("*** unknown variable: %s", name.as_string().c_str()));
+        }
+        var->SetReadOnly();
+      }
+      current_scope_ = NULL;
+      continue;
+    }
+
     Var* rhs_var = EvalRHS(lhs, rhs, StringPiece("*TODO*"), rule_var.op);
-    if (rhs_var)
-      current_scope_->Assign(lhs, new RuleVar(rhs_var, rule_var.op));
+    if (rhs_var) {
+      bool readonly;
+      current_scope_->Assign(lhs, new RuleVar(rhs_var, rule_var.op), &readonly);
+      if (readonly) {
+        Error(StringPrintf("*** cannot assign to readonly variable: %s", lhs.c_str()));
+      }
+    }
     current_scope_ = NULL;
   }
 }
@@ -192,8 +247,7 @@ void Evaluator::EvalIf(const IfStmt* stmt) {
       if (lhs.str().find_first_of(" \t") != string::npos)
         Error("*** invalid syntax in conditional.");
       Var* v = LookupVarInCurrentScope(lhs);
-      const string&& s = v->Eval(this);
-      is_true = (s.empty() == (stmt->op == CondOp::IFNDEF));
+      is_true = (v->String().empty() == (stmt->op == CondOp::IFNDEF));
       break;
     }
     case CondOp::IFEQ:
@@ -222,7 +276,9 @@ void Evaluator::EvalIf(const IfStmt* stmt) {
 
 void Evaluator::DoInclude(const string& fname) {
   Makefile* mk = MakefileCacheManager::Get()->ReadMakefile(fname);
-  CHECK(mk->Exists());
+  if (!mk->Exists()) {
+    Error(StringPrintf("%s does not exist", fname.c_str()));
+  }
 
   Var* var_list = LookupVar(Intern("MAKEFILE_LIST"));
   var_list->AppendVar(this, NewLiteral(Intern(TrimLeadingCurdir(fname)).str()));
@@ -244,7 +300,7 @@ void Evaluator::EvalInclude(const IncludeStmt* stmt) {
 
     if (stmt->should_exist) {
       if (files->empty()) {
-        // TOOD: Kati does not support building a missing include file.
+        // TODO: Kati does not support building a missing include file.
         Error(StringPrintf("%s: %s", pat.data(), strerror(errno)));
       }
     }
@@ -252,7 +308,7 @@ void Evaluator::EvalInclude(const IncludeStmt* stmt) {
     for (const string& fname : *files) {
       if (!stmt->should_exist && g_flags.ignore_optional_include_pattern &&
           Pattern(g_flags.ignore_optional_include_pattern).Match(fname)) {
-        return;
+        continue;
       }
       DoInclude(fname);
     }
@@ -308,6 +364,22 @@ Var* Evaluator::LookupVarInCurrentScope(Symbol name) {
 
 string Evaluator::EvalVar(Symbol name) {
   return LookupVar(name)->Eval(this);
+}
+
+string Evaluator::GetShell() {
+  return EvalVar(kShellSym);
+}
+
+string Evaluator::GetShellFlag() {
+  // TODO: Handle $(.SHELLFLAGS)
+  return is_posix_ ? "-ec" : "-c";
+}
+
+string Evaluator::GetShellAndFlag() {
+  string shell = GetShell();
+  shell += ' ';
+  shell += GetShellFlag();
+  return shell;
 }
 
 void Evaluator::Error(const string& msg) {

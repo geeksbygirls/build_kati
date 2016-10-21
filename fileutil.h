@@ -15,6 +15,8 @@
 #ifndef FILEUTIL_H_
 #define FILEUTIL_H_
 
+#include <errno.h>
+
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -34,8 +36,8 @@ enum struct RedirectStderr {
   DEV_NULL,
 };
 
-int RunCommand(const string& shell, const string& cmd,
-               RedirectStderr redirect_stderr,
+int RunCommand(const string& shell, const string& shellflag,
+               const string& cmd, RedirectStderr redirect_stderr,
                string* out);
 
 void GetExecutablePath(string* path);
@@ -45,5 +47,13 @@ void Glob(const char* pat, vector<string>** files);
 const unordered_map<string, vector<string>*>& GetAllGlobCache();
 
 void ClearGlobCache();
+
+#define HANDLE_EINTR(x) ({                                \
+      int r;                                              \
+      do {                                                \
+        r = (x);                                          \
+      } while (r == -1 && errno == EINTR);                \
+      r;                                                  \
+    })
 
 #endif  // FILEUTIL_H_
